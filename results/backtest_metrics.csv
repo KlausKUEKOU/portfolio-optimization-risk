@@ -1,0 +1,5 @@
+Strategy,CAGR,Volatility,Sharpe (rf=0),Max drawdown,Worst day,Avg monthly turnover,99% 1-day hist. VaR,99% 1-day ES
+Equal weight,0.1256,0.2257,0.6374,-0.5647,-0.1026,0.0636,0.0381,0.0584
+Minimum variance,0.0847,0.1616,0.5839,-0.3894,-0.0820,0.0895,0.0293,0.0415
+Max Sharpe (capped),0.1670,0.2429,0.7575,-0.5649,-0.1185,0.3188,0.0417,0.0594
+Risk parity,0.1208,0.2057,0.6573,-0.5284,-0.0965,0.0604,0.0357,0.0541
