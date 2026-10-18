@@ -1,77 +1,146 @@
-"""Long-only portfolio construction rules.
+# Règles de construction de portefeuille (positions longues uniquement).
+#
+# Chaque fonction reçoit une matrice de covariance (et parfois les rendements attendus)
+# estimée sur une fenêtre passée, et renvoie des poids positifs dont la somme vaut 1.
 
-Every function takes a covariance matrix (and, where needed, a vector of expected
-returns) estimated on a lookback window and returns weights that sum to one.
-"""
 import numpy as np
 from scipy.optimize import minimize
-from sklearn.covariance import LedoitWolf
 
 
+# ------------------------------------------------------------------------------
+# ALGORITHME CovarianceLedoitWolf  (Ledoit et Wolf, 2004)
+# Idée : la covariance empirique est bruitée quand on a beaucoup d'actifs.
+#        On la "rétrécit" vers une cible simple : mu x Identité.
+# ENTREE : R = matrice des rendements (n jours x p actifs)
+# DEBUT
+#   X <- R moins la moyenne de chaque colonne
+#   S <- X'X / n                                  (covariance empirique)
+#   mu <- trace(S) / p                            (variance moyenne)
+#   delta <- distance entre S et mu x I           (à quel point S est loin de la cible)
+#   beta <- bruit d'estimation de S               (calculé jour par jour)
+#   alpha <- min(beta, delta) / delta             (intensité du rétrécissement, entre 0 et 1)
+#   RETOURNER (1 - alpha) x S + alpha x mu x I, multiplié par 252 (annualisation)
+# FIN
+# ------------------------------------------------------------------------------
 def ledoit_wolf_cov(returns):
-    """Ledoit-Wolf shrinkage covariance, annualised (252 trading days)."""
-    lw = LedoitWolf().fit(returns.values)
-    return lw.covariance_ * 252
+    X = returns.values
+    n, p = X.shape
+    X = X - X.mean(axis=0)
+
+    S = X.T @ X / n
+    trace_by_asset = (X ** 2).sum(axis=0) / n
+    mu = trace_by_asset.sum() / p
+
+    sum_fourth = ((X ** 2).T @ (X ** 2)).sum()
+    sum_sq_cov = ((X.T @ X) ** 2).sum() / n ** 2
+    beta = (sum_fourth / n - sum_sq_cov) / (p * n)
+    delta = (sum_sq_cov - 2 * mu * trace_by_asset.sum() + p * mu ** 2) / p
+    if beta > delta:
+        beta = delta
+    if beta == 0:
+        alpha = 0.0
+    else:
+        alpha = beta / delta
+
+    shrunk = (1 - alpha) * S
+    for i in range(p):
+        shrunk[i, i] = shrunk[i, i] + alpha * mu
+    return shrunk * 252
 
 
-def sample_cov(returns):
-    return returns.cov().values * 252
+def portfolio_variance(w, cov):
+    return w @ cov @ w
 
 
-def _solve(objective, n, bounds=None):
-    w0 = np.full(n, 1.0 / n)
-    cons = ({"type": "eq", "fun": lambda w: w.sum() - 1.0},)
-    res = minimize(objective, w0, method="SLSQP", bounds=bounds or [(0.0, 1.0)] * n,
-                   constraints=cons, options={"maxiter": 1000, "ftol": 1e-12})
-    w = np.clip(res.x, 0, None)
+def solve(objective, n, bounds):
+    """Minimise objective(w) sous les contraintes : somme des poids = 1 et bornes sur chaque poids.
+    Le calcul est confié au solveur numérique SLSQP de scipy, en partant de poids égaux."""
+    start = np.full(n, 1.0 / n)
+    constraint = {"type": "eq", "fun": lambda w: w.sum() - 1.0}
+    result = minimize(objective, start, method="SLSQP", bounds=bounds, constraints=(constraint,),
+                      options={"maxiter": 1000, "ftol": 1e-12})
+    w = result.x
+    for i in range(n):                                  # nettoyage des petits négatifs numériques
+        if w[i] < 0:
+            w[i] = 0.0
     return w / w.sum()
 
 
+# 1/N : le même poids pour tout le monde
 def equal_weight(cov, mu=None):
     n = cov.shape[0]
     return np.full(n, 1.0 / n)
 
 
+# Variance minimale : minimiser w' x Cov x w
 def min_variance(cov, mu=None):
-    return _solve(lambda w: w @ cov @ w, cov.shape[0])
+    n = cov.shape[0]
+    bounds = []
+    for i in range(n):
+        bounds.append((0.0, 1.0))
+    return solve(lambda w: portfolio_variance(w, cov), n, bounds)
 
 
-def max_sharpe(cov, mu, rf=0.0, max_weight=0.30):
-    """Tangency portfolio with a 30% cap per asset to limit estimation-error bets."""
+# Ratio de Sharpe maximal, avec 30 % maximum par action pour limiter les paris sur des erreurs d'estimation
+def max_sharpe(cov, mu, max_weight=0.30):
     n = cov.shape[0]
 
-    def neg_sharpe(w):
-        vol = np.sqrt(w @ cov @ w)
-        return -(w @ mu - rf) / vol
+    def minus_sharpe(w):
+        return -(w @ mu) / np.sqrt(portfolio_variance(w, cov))
 
-    return _solve(neg_sharpe, n, bounds=[(0.0, max_weight)] * n)
+    bounds = []
+    for i in range(n):
+        bounds.append((0.0, max_weight))
+    return solve(minus_sharpe, n, bounds)
 
 
+# ------------------------------------------------------------------------------
+# ALGORITHME ParitéDeRisque
+# Contribution au risque de l'actif i : RC_i = w_i x (Cov x w)_i / variance du portefeuille
+# On cherche les poids tels que chaque RC_i = 1/n.
+# On minimise donc la somme des écarts au carré (RC_i - 1/n)².
+# ------------------------------------------------------------------------------
 def risk_parity(cov, mu=None):
-    """Equal risk contribution: each asset contributes the same share of variance."""
     n = cov.shape[0]
 
-    def objective(w):
-        port_var = w @ cov @ w
-        rc = w * (cov @ w) / port_var
-        return ((rc - 1.0 / n) ** 2).sum()
+    def gap(w):
+        total_var = portfolio_variance(w, cov)
+        marginal = cov @ w
+        error = 0.0
+        for i in range(n):
+            contribution = w[i] * marginal[i] / total_var
+            error = error + (contribution - 1.0 / n) ** 2
+        return error
 
-    return _solve(objective, n, bounds=[(1e-6, 1.0)] * n)
+    bounds = []
+    for i in range(n):
+        bounds.append((1e-6, 1.0))
+    return solve(gap, n, bounds)
 
 
+# ------------------------------------------------------------------------------
+# ALGORITHME FrontièreEfficiente
+# POUR chaque rendement cible entre celui du portefeuille de variance minimale et le maximum FAIRE
+#     trouver les poids de variance minimale qui donnent exactement ce rendement
+#     garder le point (volatilité, rendement)
+# ------------------------------------------------------------------------------
 def efficient_frontier(cov, mu, points=40):
-    """Long-only frontier: minimum variance for a grid of target returns."""
     n = cov.shape[0]
-    lo, hi = min_variance(cov) @ mu, mu.max()
-    out = []
-    for target in np.linspace(lo, hi * 0.999, points):
-        cons = ({"type": "eq", "fun": lambda w: w.sum() - 1.0},
-                {"type": "eq", "fun": lambda w, t=target: w @ mu - t})
-        res = minimize(lambda w: w @ cov @ w, np.full(n, 1.0 / n), method="SLSQP",
-                       bounds=[(0, 1)] * n, constraints=cons, options={"maxiter": 1000})
-        if res.success:
-            out.append((np.sqrt(res.x @ cov @ res.x), target))
-    return np.array(out)
+    low = min_variance(cov) @ mu
+    high = mu.max() * 0.999
+    frontier = []
+    for k in range(points):
+        target = low + (high - low) * k / (points - 1)
+        constraints = ({"type": "eq", "fun": lambda w: w.sum() - 1.0},
+                       {"type": "eq", "fun": lambda w, t=target: w @ mu - t})
+        bounds = []
+        for i in range(n):
+            bounds.append((0.0, 1.0))
+        result = minimize(lambda w: portfolio_variance(w, cov), np.full(n, 1.0 / n), method="SLSQP",
+                          bounds=bounds, constraints=constraints, options={"maxiter": 1000})
+        if result.success:
+            frontier.append((np.sqrt(portfolio_variance(result.x, cov)), target))
+    return np.array(frontier)
 
 
 STRATEGIES = {
